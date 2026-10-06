@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 from functools import lru_cache
 
 import duckdb
@@ -10,19 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-LOCAL_PARQUET = os.environ.get("LOCAL_PARQUET")
-ACCESS_KEY    = os.environ.get("AWS_ACCESS_KEY_ID", "")
-SECRET_KEY    = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
-DB_DIR  = os.environ.get("DB_DIR", "/data" if os.path.isdir("/data") else "/tmp")
-DB_PATH = os.path.join(DB_DIR, "search.duckdb")
-# Uvicorn workers ki ginti (pre-warm ke liye)
-WORKERS = int(os.environ.get("WORKERS", "4"))
+ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "")
+SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 
-PARQUET_FILES = [LOCAL_PARQUET] if LOCAL_PARQUET else [
+PARQUET_FILES = [
     "s3://my-db/part1.parquet",
     "s3://my-db/part2a.parquet",
     "s3://my-db/part2b_new.parquet",
 ]
+PQ_LIST = str(PARQUET_FILES)  # DuckDB list syntax
 
 COLUMNS   = ["name", "fathersName", "phoneNumber", "aadharNumber",
              "otherNumber", "address", "district", "pincode", "state", "town"]
@@ -39,82 +36,80 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Thread-local read-only connection pool
+# DuckDB connection pool (thread-local)
+# Har thread ka alag connection — parallel requests block nahi hote
 # ---------------------------------------------------------------------------
 _local = threading.local()
 _ready = threading.Event()
 
 
+def _make_conn() -> duckdb.DuckDBPyConnection:
+    """Ek naya S3-ready DuckDB connection banao."""
+    c = duckdb.connect()
+    c.execute("INSTALL httpfs"); c.execute("LOAD httpfs")
+    c.execute(f"""
+    CREATE OR REPLACE SECRET hf (
+        TYPE s3,
+        KEY_ID '{ACCESS_KEY}',
+        SECRET '{SECRET_KEY}',
+        ENDPOINT 's3.hf.co/adityasinghlko000',
+        URL_STYLE 'path',
+        REGION 'us-east-1'
+    )""")
+    # S3 performance settings
+    c.execute("SET threads TO 8")
+    c.execute("SET s3_url_compatibility_mode = true")
+    return c
+
+
 def _get_conn() -> duckdb.DuckDBPyConnection:
-    """Har thread ka alag read-only connection. Build ke baad hi kaam karta hai."""
+    """Thread-local connection laao, nahi hai to banao."""
     if not hasattr(_local, "con"):
-        _local.con = duckdb.connect(DB_PATH, read_only=True)
+        _local.con = _make_conn()
     return _local.con
 
 
 # ---------------------------------------------------------------------------
-# One-time DB build  (background thread)
+# Startup: ek connection test karo, phir ready
 # ---------------------------------------------------------------------------
-def _build_db():
-    w = duckdb.connect(DB_PATH)   # write connection — sirf yahan
+def _startup():
     try:
-        exists = w.execute(
-            "SELECT count(*) FROM information_schema.tables WHERE table_name='data'"
-        ).fetchone()[0]
-
-        if not exists:
-            if not LOCAL_PARQUET:
-                w.execute("INSTALL httpfs"); w.execute("LOAD httpfs")
-                w.execute(f"""
-                CREATE OR REPLACE SECRET hf (
-                    TYPE s3, KEY_ID '{ACCESS_KEY}', SECRET '{SECRET_KEY}',
-                    ENDPOINT 's3.hf.co/adityasinghlko000',
-                    URL_STYLE 'path', REGION 'us-east-1'
-                )""")
-
-            cols = ", ".join(f"CAST({c} AS VARCHAR) AS {c}" for c in COLUMNS)
-            w.execute(
-                f"CREATE TABLE data AS SELECT {cols} "
-                f"FROM read_parquet({PARQUET_FILES}, union_by_name=true)"
-            )
-            # Numeric index — exact phone/aadhar/pincode lookups instant
-            for c in NUM_COLS:
-                w.execute(f"CREATE INDEX idx_{c} ON data({c})")
-
-            w.execute("CHECKPOINT")
-
-    finally:
-        w.close()   # zaroori — is ke band hone ke baad hi read-only connections khulenge
-
-    # --- Pre-warm: N threads banao, har ek ka connection cache ho jata hai ---
-    def _warm(dummy):
-        con = _get_conn()
-        con.execute("SELECT 1").fetchone()      # connection initialize karo
-        _run_search("test", 1)                  # query planner bhi warm karo
-
-    threads = [threading.Thread(target=_warm, args=(i,)) for i in range(WORKERS)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-
-    _ready.set()
+        print("[startup] S3 connection test ho raha hai...")
+        c = _make_conn()
+        # Sirf ek chhota sa test — poora data load nahi
+        row = c.execute(
+            f"SELECT name, phoneNumber FROM read_parquet({PQ_LIST}, union_by_name=true) LIMIT 1"
+        ).fetchone()
+        print(f"[startup] Connection OK, sample row: {row}")
+        # Main thread ka connection bhi set karo
+        _local.con = c
+        _ready.set()
+        print("[startup] API ready!")
+    except Exception as e:
+        print(f"[startup] ERROR: {e}")
 
 
-threading.Thread(target=_build_db, daemon=True).start()
+threading.Thread(target=_startup, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
-# Cached search — LRU 8192 entries
+# Search — cached (8192 entries), S3 pe direct query
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=8192)
 def _run_search(q: str, limit: int) -> tuple:
     con = _get_conn()
+    cols_sql = ", ".join(COLUMNS)
 
     if re.fullmatch(r"\d+", q):
-        # Numeric: har column alag — index use hota hai (OR me index skip ho jata)
+        # --- Numeric: exact match, har column alag ---
+        # Parquet row-group statistics se DuckDB most files skip kar deta hai
         out: list = []
         for col in NUM_COLS:
             rows = con.execute(
-                f"SELECT {', '.join(COLUMNS)} FROM data WHERE {col} = ? LIMIT ?",
+                f"""SELECT {cols_sql}
+                    FROM read_parquet({PQ_LIST}, union_by_name=true)
+                    WHERE {col} = ?
+                    LIMIT ?""",
                 [q, limit],
             ).fetchall()
             out.extend(rows)
@@ -123,11 +118,15 @@ def _run_search(q: str, limit: int) -> tuple:
         return tuple(out[:limit])
 
     else:
-        # Text: sirf text columns pe ILIKE (10 cols se 6 cols — kaafi faster)
-        cond = " OR ".join(f"{c} ILIKE ?" for c in TEXT_COLS)
+        # --- Text: ILIKE sirf text columns pe ---
+        cond   = " OR ".join(f"{c} ILIKE ?" for c in TEXT_COLS)
+        params = [f"%{q}%"] * len(TEXT_COLS) + [limit]
         rows = con.execute(
-            f"SELECT {', '.join(COLUMNS)} FROM data WHERE {cond} LIMIT ?",
-            [f"%{q}%"] * len(TEXT_COLS) + [limit],
+            f"""SELECT {cols_sql}
+                FROM read_parquet({PQ_LIST}, union_by_name=true)
+                WHERE {cond}
+                LIMIT ?""",
+            params,
         ).fetchall()
         return tuple(rows)
 
@@ -157,10 +156,13 @@ def search(
     if not _ready.is_set():
         return {"query": q, "count": 0, "status": "loading", "results": []}
     q = q.strip()
+    t = time.time()
     rows = _run_search(q, limit)
+    elapsed = round(time.time() - t, 3)
     return {
         "query": q,
         "count": len(rows),
+        "time_s": elapsed,
         "owner": "@its_Secretz",
         "results": [dict(zip(COLUMNS, row)) for row in rows],
     }
