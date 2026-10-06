@@ -1,6 +1,6 @@
 import duckdb,time,os,sys
-KEY="HFAKWRwoRnXddwkYnjkupw4IU4SEXtS"
-SEC="c17ce7362dac1c51448358ff3bea280f33fedcba71228409b812348b50237c85"
+KEY="HFAKfwV25funOIh8AuOKoLOPNpBfMGI"
+SEC="169d8dc685e022cd1531d023c38c9282919c1f7b1f13cf6ccf826e7257fdf09a"
 C="name,fathersName,phoneNumber,aadharNumber,otherNumber,address,district,pincode,state,town"
 os.makedirs("/root/dt",exist_ok=True)
 def mk():
